@@ -1799,6 +1799,20 @@ class AgentActivity(RecognitionHooks):
             skip_reply=skip_reply,
         )
 
+    def _record_interruption(self, speech_handle: SpeechHandle) -> None:
+        """Once per speech: an ``interrupted`` event on its agent_turn span naming the source."""
+        if not speech_handle.interrupted or speech_handle._interruption_recorded:
+            return
+        speech_handle._interruption_recorded = True
+        span = trace.get_current_span(context=speech_handle._agent_turn_context)
+        span.add_event(
+            "interrupted",
+            {
+                trace_types.ATTR_INTERRUPTION_SOURCE: speech_handle._interrupt_source
+                or "programmatic"
+            },
+        )
+
     def _record_queue_wait(self, speech_handle: SpeechHandle) -> None:
         """Stamp how long the speech sat in the queue on its agent_turn span."""
         if (queue_wait := speech_handle._queue_wait()) is None:
@@ -2185,6 +2199,9 @@ class AgentActivity(RecognitionHooks):
                 # replying turn commit interrupts the paused handle.
                 self._update_paused_speech(self._current_speech, timeout)
                 audio_output.pause()
+                trace.get_current_span(context=self._current_speech._agent_turn_context).add_event(
+                    "playout_paused"
+                )
                 self._session._update_agent_state("listening")
                 self._on_end_of_agent_speech(ended_at=time.time())
                 if self.interruption_enabled:
@@ -2193,6 +2210,7 @@ class AgentActivity(RecognitionHooks):
                 if self._rt_session is not None:
                     self._rt_session.interrupt()
 
+                self._current_speech._set_interrupt_source("audio_activity")
                 self._current_speech.interrupt()
         elif self._current_speech is None or not self._current_speech.interrupted:
             self._interruption_detected = False
@@ -2585,6 +2603,7 @@ class AgentActivity(RecognitionHooks):
                 return
             await self._cancel_speech_pause(self._cancel_speech_pause_task)
 
+            current_speech._set_interrupt_source("user_turn")
             await current_speech.interrupt()
 
             if self._rt_session is not None:
@@ -2946,6 +2965,7 @@ class AgentActivity(RecognitionHooks):
 
         if speech_handle.interrupted:
             current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, True)
+            self._record_interruption(speech_handle)
             await utils.aio.cancel_and_wait(*authorization_tasks)
             return
 
@@ -3065,6 +3085,7 @@ class AgentActivity(RecognitionHooks):
 
         stopped_speaking_at = time.time()
         current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, speech_handle.interrupted)
+        self._record_interruption(speech_handle)
         if speech_handle.interrupted:
             await utils.aio.cancel_and_wait(*all_tasks)
 
@@ -3079,6 +3100,9 @@ class AgentActivity(RecognitionHooks):
         forwarded_text = text_out.text if text_out else ""
         if speech_handle.interrupted and audio_output is not None:
             playback_ev = await audio_output.wait_for_playout()
+            current_span.set_attribute(
+                trace_types.ATTR_PLAYOUT_POSITION, playback_ev.playback_position
+            )
 
             played_own_frame = (
                 audio_out is not None
@@ -3386,6 +3410,7 @@ class AgentActivity(RecognitionHooks):
 
         if speech_handle.interrupted:
             current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, True)
+            self._record_interruption(speech_handle)
             await utils.aio.cancel_and_wait(*tasks, wait_for_scheduled)
             return
 
@@ -3410,6 +3435,7 @@ class AgentActivity(RecognitionHooks):
 
         if speech_handle.interrupted:
             current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, True)
+            self._record_interruption(speech_handle)
             await utils.aio.cancel_and_wait(*tasks, *authorization_tasks)
             return
 
@@ -3586,6 +3612,13 @@ class AgentActivity(RecognitionHooks):
                 current_span.set_attribute(trace_types.ATTR_E2E_LATENCY, e2e_latency)
 
         current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, speech_handle.interrupted)
+        self._record_interruption(speech_handle)
+        if speech_handle.interrupted and segment_outputs:
+            # how far into the reply the user cut in, summed over the played segments
+            current_span.set_attribute(
+                trace_types.ATTR_PLAYOUT_POSITION,
+                sum(out.playback_position for out in segment_outputs),
+            )
 
         forwarded_text = "".join(out.forwarded_text for out in segment_outputs)
         if speech_handle.interrupted:
@@ -4019,6 +4052,7 @@ class AgentActivity(RecognitionHooks):
             for tee in tees:
                 await tee.aclose()
             current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, True)
+            self._record_interruption(speech_handle)
             return  # TODO(theomonnom): remove the message from the serverside history
 
         started_speaking_at: float | None = None
@@ -4191,6 +4225,7 @@ class AgentActivity(RecognitionHooks):
             self._rt_session.interrupt()
 
         current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, speech_handle.interrupted)
+        self._record_interruption(speech_handle)
         current_span.set_attribute(
             trace_types.ATTR_RESPONSE_FUNCTION_CALLS,
             json.dumps([fnc.model_dump(exclude={"type", "created_at"}) for fnc in function_calls]),
@@ -4578,6 +4613,12 @@ class AgentActivity(RecognitionHooks):
                 resumed = True
                 logger.debug("resumed false interrupted speech", extra={"timeout": timeout})
 
+            trace.get_current_span(
+                context=self._paused_speech.handle._agent_turn_context
+            ).add_event(
+                "false_interruption",
+                {trace_types.ATTR_FALSE_INTERRUPTION_RESUMED: resumed},
+            )
             self._session.emit(
                 "agent_false_interruption", AgentFalseInterruptionEvent(resumed=resumed)
             )
